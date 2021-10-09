@@ -1,0 +1,59 @@
+#!/usr/bin/env python
+# -*- Mode: Python; coding: utf-8;
+
+import pwquality
+import sys
+
+import gettext
+# import locale
+LOCALEDIR = "/usr/share/locale"
+_ = gettext.gettext
+
+domain = "libpwquality"
+gettext.bindtextdomain(domain, LOCALEDIR)
+gettext.textdomain(domain)
+_ = gettext.gettext
+
+pwsetting = pwquality.PWQSettings()
+pwsetting.read_config()
+
+def set_locales():
+    # locale.setlocale(locale.LC_ALL, "")
+    domain = "libpwquality"
+    gettext.bindtextdomain(domain, LOCALEDIR)
+    gettext.textdomain(domain)
+    # gettext.install(domain, LOCALEDIR)
+    # domain = 'libpwquality'
+    # locale.bindtextdomain(domain, LOCALEDIR)
+    # locale.textdomain(domain)
+    # gettext.bindtextdomain(domain, LOCALEDIR)
+    # gettext.textdomain(domain)
+
+
+def read_config():
+    print("pwquality settings:")
+    print("minlen:", pwsetting.minlen)
+    print("minclass:", pwsetting.minclass)
+    print("dictcheck:", pwsetting.dictcheck)
+
+def check_pass(passwd):
+    try:
+        pwsetting.check(passwd)
+        print("ok;")
+    except pwquality.PWQError as e:
+        print("error;" +  _(e.args[1]))
+
+
+if __name__ == '__main__':
+    # set_locales()
+    if len(sys.argv) != 2 and len(sys.argv) != 3:
+        print(sys.argv[0] + ":\n\t\tread\n\t\tcheck\t<passwd>")
+        sys.exit(1)
+
+    if sys.argv[1] == "read" and len(sys.argv) == 2:
+        read_config()
+        sys.exit(0)
+
+    if sys.argv[1] == "check" and len(sys.argv) == 3:
+        check_pass(sys.argv[2])
+        sys.exit(0)

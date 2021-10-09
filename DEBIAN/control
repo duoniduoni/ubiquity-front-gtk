@@ -1,0 +1,16 @@
+Package: ubiquity-frontend-gtk
+Source: ubiquity
+Version: 2.21.63kord-0k144
+Architecture: amd64
+Maintainer: Kylin Developers <devel-discuss@kylinos.cn>
+Installed-Size: 864
+Depends: libc6 (>= 2.4), libcairo2 (>= 1.2.4), libgdk-pixbuf2.0-0 (>= 2.22.0), libglib2.0-0 (>= 2.37.3), libgtk-3-0 (>= 3.0.0), libido3-0.1-0 (>= 13.10.0daily13.06.19), libindicator3-7 (>= 0.4.90), libx11-6, python3:any (>= 3.3.2-2~), ubiquity (>= 2.21.63kord-0k144), python3-dbus, gir1.2-gtk-3.0, gir1.2-pango-1.0, gir1.2-soup-2.4, gir1.2-vte-2.91, gir1.2-webkit2-4.0, iso-codes, mutter | metacity | marco | xfwm4 | matchbox-window-manager | lubuntu-default-settings | openbox | gnome-shell, gir1.2-xkl-1.0, gir1.2-timezonemap-1.0, python3-gi, python3-cairo, python3-gi-cairo, gir1.2-appindicator3-0.1, busybox-static | busybox, gir1.2-webkit-3.0, python-pwquality
+Suggests: gnome-control-center | feh
+Conflicts: espresso-frontend-gtk, ubiquity (<< 2.4.3), ubuntu-express-frontend-gtk
+Replaces: espresso-frontend-gtk, ubiquity (<< 2.4.3), ubuntu-express-frontend-gtk
+Provides: indicator-renderer, ubiquity-frontend-2.21.63kord-0k144
+Section: admin
+Priority: optional
+Description: GTK+ frontend for Ubiquity live installer
+ This package provides a GTK+-based user interface frontend for the Ubiquity
+ live CD installer.
