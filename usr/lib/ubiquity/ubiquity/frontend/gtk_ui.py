@@ -45,16 +45,17 @@ import syslog
 import traceback
 
 import dbus
+assert dbus  # silence, pyflakes!
 from dbus.mainloop.glib import DBusGMainLoop
 DBusGMainLoop(set_as_default=True)
 
 # in query mode we won't be in X, but import needs to pass
 if 'DISPLAY' in os.environ:
-    from gi.repository import Gtk, Gdk, GObject, GLib, Atk
+    from gi.repository import Gtk, Gdk, GObject, GLib, Atk, Gio
     from ubiquity import gtkwidgets
 
 from ubiquity import (
-    filteredcommand, gsettings, i18n, validation, misc, osextras)
+    filteredcommand, gsettings, i18n, validation, misc, osextras, telemetry)
 from ubiquity.components import install, plugininstall, partman_commit
 import ubiquity.frontend.base
 from ubiquity.frontend.base import BaseFrontend
@@ -149,14 +150,28 @@ class Controller(ubiquity.frontend.base.Controller):
             self._wizard.navigation_control.hide()
         self._wizard.refresh()
 
-    def toggle_next_button(self, label='gtk-go-forward'):
-        self._wizard.toggle_next_button(label)
+    def toggle_next_button(self, label='gtk-go-forward', suggested=False):
+        self._wizard.toggle_next_button(label, suggested=suggested)
 
     def toggle_skip_button(self, label='skip'):
         self._wizard.toggle_skip_button(label)
 
     def switch_to_install_interface(self):
         self._wizard.switch_to_install_interface()
+
+
+def on_screen_reader_enabled_changed(gsettings, key):
+    # handle starting orca only, it exits itself when the key is false
+    if key == "screen-reader-enabled":
+        # Besides starting orca, also make sure the screen-reader-enabled
+        # setting gets passed to the target system.
+        if (gsettings.get_boolean(key) and osextras.find_on_path('orca')):
+            # Enable
+            subprocess.Popen(['orca'], preexec_fn=misc.drop_all_privileges)
+            os.environ['UBIQUITY_A11Y_PROFILE'] = 'screen-reader'
+        elif 'UBIQUITY_A11Y_PROFILE' in os.environ:
+            # Disable
+            del os.environ['UBIQUITY_A11Y_PROFILE']
 
 
 class Wizard(BaseFrontend):
@@ -212,9 +227,11 @@ class Wizard(BaseFrontend):
         self.language_questions = ('live_installer', 'quit', 'back', 'next',
                                    'warning_dialog', 'warning_dialog_label',
                                    'cancelbutton', 'exitbutton',
-                                   'install_button', 'restart_to_continue')
+                                   'install_button',
+                                   'restart_button',
+                                   'restart_to_continue')
         self.current_page = None
-        self.backup = None
+        self.backup = False
         self.allowed_change_step = True
         self.allowed_go_backward = True
         self.allowed_go_forward = True
@@ -223,6 +240,9 @@ class Wizard(BaseFrontend):
         self.progress_cancelled = False
         self.installing = False
         self.installing_no_return = False
+        self.partitioned = False
+        self.timezone_set = False
+        self.ubuntu_drivers = None
         self.returncode = 0
         self.history = []
         self.builder = Gtk.Builder()
@@ -234,6 +254,7 @@ class Wizard(BaseFrontend):
         self.timeout_id = None
         self.screen_reader = False
         self.orca_process = None
+        self.a11y_settings = None
 
         # To get a "busy mouse":
         self.watch = Gdk.Cursor.new(Gdk.CursorType.WATCH)
@@ -244,6 +265,22 @@ class Wizard(BaseFrontend):
         with open('/proc/cmdline') as fp:
             if 'access=v3' in fp.read():
                 self.screen_reader = True
+
+        if 'UBIQUITY_ONLY' in os.environ:
+            # do not run this as root. The API pretends to be synchronous but
+            # it is actually asynchronous. If you become root before it
+            # finishes then D-Bus will reject our connection due to a
+            # mismatched user between the requestor and the owner of the
+            # session bus.
+
+            # handle orca only in ubiquity-dm where there is no gnome-session
+            self.a11y_settings = Gio.Settings.new(
+                "org.gnome.desktop.a11y.applications")
+            self.a11y_settings.connect("changed::screen-reader-enabled",
+                                       on_screen_reader_enabled_changed)
+            # enable if needed and a key read is needed to connect the signal
+            on_screen_reader_enabled_changed(self.a11y_settings,
+                                             "screen-reader-enabled")
 
         # set default language
         self.locale = i18n.reset_locale(self)
@@ -256,18 +293,24 @@ class Wizard(BaseFrontend):
         # Make a thin Progress bar
         provider = Gtk.CssProvider()
         provider.load_from_data(b'''\
-            .inline-toolbar.toolbar {
+            toolbar {
                 background: @theme_bg_color;
                 border-color: transparent;
                 border-width: 0px;
                 padding: 0px;
             }
-            GtkProgressBar {
-              -GtkProgressBar-min-horizontal-bar-height : 10;
-              -GtkProgressBar-min-horizontal-bar-width : 10;
+            progressbar trough {
+              min-height: 10px;
+              min-width: 11px;
+              border: none;
             }
-            GtkPaned {
-                -GtkPaned-handle-size: 10;
+            progressbar progress {
+              min-height: 10px;
+              border-radius: 4px;
+              border: none;
+            }
+            paned separator {
+                min-width: 10px;
             }
             ''')
         Gtk.StyleContext.add_provider_for_screen(
@@ -348,19 +391,31 @@ class Wizard(BaseFrontend):
         self.customize_installer()
 
         # Put up the a11y indicator.
-#        if osextras.find_on_path('a11y-profile-manager-indicator'):
-#            try:
-#                subprocess.Popen(['a11y-profile-manager-indicator',
-#                                  '-i'], preexec_fn=misc.drop_all_privileges)
-#                if osextras.find_on_path('canberra-gtk-play'):
-#                    subprocess.Popen(
-#                        ['canberra-gtk-play', '--id=system-ready'],
-#                        preexec_fn=misc.drop_all_privileges)
-#            except:
-#                print("Unable to set up accessibility profile support",
-#                      file=sys.stderr)
-#            self.live_installer.connect(
-#                'key-press-event', self.a11y_profile_keys)
+        if osextras.find_on_path('a11y-profile-manager-indicator'):
+            try:
+                subprocess.Popen(['a11y-profile-manager-indicator',
+                                  '-i'], preexec_fn=misc.drop_all_privileges)
+            except Exception:
+                print("Unable to set up accessibility profile support",
+                      file=sys.stderr)
+            self.live_installer.connect(
+                'key-press-event', self.a11y_profile_keys)
+
+        if osextras.find_on_path('canberra-gtk-play'):
+            subprocess.Popen(
+                ['canberra-gtk-play', '--id=system-ready'],
+                preexec_fn=misc.drop_all_privileges)
+
+        with misc.raised_privileges():
+            if osextras.find_on_path('ubuntu-drivers'):
+                self.ubuntu_drivers = subprocess.Popen(
+                    ['ubuntu-drivers',
+                     'list-oem',
+                     '--package-list',
+                     '/run/ubuntu-drivers-oem.autoinstall'],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL)
 
     def all_children(self, parent):
         if isinstance(parent, Gtk.Container):
@@ -464,13 +519,11 @@ class Wizard(BaseFrontend):
             sys.exit(1)
 
     def network_change(self, online=False):
-        if not online:
-            self.set_online_state(False)
-            return
-        # kobe:20160120 shade network
-        else:
-            self.set_online_state(False)
-            return
+        self.set_online_state(False)
+        return
+#        if not online:
+#            self.set_online_state(False)
+#            return
 #        if self.timeout_id:
 #            GLib.source_remove(self.timeout_id)
 #        self.timeout_id = GLib.timeout_add(300, self.check_returncode)
@@ -507,7 +560,7 @@ class Wizard(BaseFrontend):
                 os.rename('%s.new' % thunar_volmanrc, thunar_volmanrc)
             except (KeyboardInterrupt, SystemExit):
                 raise
-            except:
+            except Exception:
                 pass
         return previous
 
@@ -534,31 +587,6 @@ class Wizard(BaseFrontend):
 
         gsettings.set(gs_schema, gs_key, gs_value)
 
-    def disable_screen_reader(self):
-        gs_key = 'screenreader'
-        for gs_schema in 'org.gnome.settings-daemon.plugins.media-keys', \
-                         'org.mate.SettingsDaemon.plugins.media-keys':
-            gs_previous = '%s/%s' % (gs_schema, gs_key)
-            if gs_previous in self.gsettings_previous:
-                return
-
-            gs_value = gsettings.get(gs_schema, gs_key)
-            self.gsettings_previous[gs_previous] = gs_value
-
-            if gs_value:
-                gsettings.set(gs_schema, gs_key, '')
-
-        atexit.register(self.enable_screen_reader)
-
-    def enable_screen_reader(self):
-        gs_key = 'screenreader'
-        for gs_schema in 'org.gnome.settings-daemon.plugins.media-keys', \
-                         'org.mate.SettingsDaemon.plugins.media-keys':
-            gs_previous = '%s/%s' % (gs_schema, gs_key)
-            gs_value = self.gsettings_previous[gs_previous]
-
-            gsettings.set(gs_schema, gs_key, gs_value)
-
     def disable_screensaver(self):
         gs_schema = 'org.gnome.desktop.screensaver'
         gs_key = 'idle-activation-enabled'
@@ -577,6 +605,29 @@ class Wizard(BaseFrontend):
     def enable_screensaver(self):
         gs_schema = 'org.gnome.desktop.screensaver'
         gs_key = 'idle-activation-enabled'
+        gs_previous = '%s/%s' % (gs_schema, gs_key)
+        gs_value = self.gsettings_previous[gs_previous]
+
+        gsettings.set(gs_schema, gs_key, gs_value)
+
+    def disable_screen_blanking(self):
+        gs_schema = 'org.gnome.desktop.session'
+        gs_key = 'idle-delay'
+        gs_previous = '%s/%s' % (gs_schema, gs_key)
+        if gs_previous in self.gsettings_previous:
+            return
+
+        gs_value = gsettings.get(gs_schema, gs_key)
+        self.gsettings_previous[gs_previous] = gs_value
+
+        if gs_value:
+            gsettings.set(gs_schema, gs_key, 0)
+
+        atexit.register(self.enable_screen_blanking)
+
+    def enable_screen_blanking(self):
+        gs_schema = 'org.gnome.desktop.session'
+        gs_key = 'idle-delay'
         gs_previous = '%s/%s' % (gs_schema, gs_key)
         gs_value = self.gsettings_previous[gs_previous]
 
@@ -733,8 +784,8 @@ class Wizard(BaseFrontend):
 
         self.disable_volume_manager()
         self.disable_screensaver()
+        self.disable_screen_blanking()
         self.disable_powermgr()
-        self.disable_screen_reader()
 
         if 'UBIQUITY_ONLY' in os.environ:
             self.disable_logout_indicator()
@@ -754,8 +805,17 @@ class Wizard(BaseFrontend):
             self.debconf_progress_cancellable(False)
             self.refresh()
 
+        telemetry.get().set_installer_type('GTK')
+        telemetry.get().set_is_oem(self.oem_config)
+
         self.set_current_page(0)
         self.live_installer.show()
+
+        idx = 0
+        while(idx < len(self.pages)):
+            syslog.syslog("fucking life self.pages[%d] : %s " % (idx, self.pages[idx].module.__name__))
+            idx = idx + 1
+        syslog.syslog("fucking life *******************************************")
 
         while(self.pagesindex < len(self.pages)):
             if self.current_page is None:
@@ -769,6 +829,8 @@ class Wizard(BaseFrontend):
             automatic = False
             if hasattr(page.ui, 'is_automatic'):
                 automatic = page.ui.is_automatic
+
+            syslog.syslog("fucking life current plug : %s %r %r" %(page.module.NAME, skip, automatic))
 
             if not skip and not page.filter_class:
                 # This page is just a UI page
@@ -812,21 +874,13 @@ class Wizard(BaseFrontend):
 
         # There's still work to do (postinstall).  Let's keep the user
         # entertained.
-        #kylin skip button
-        if os.path.isfile("/tmp/kylin_ubiquity_config"):
-            import configparser
-            kyconfig = configparser.ConfigParser()
-            kyconfig.read("/tmp/kylin_ubiquity_config")
-            if kyconfig.has_option("info","lang"):
-                kylang = kyconfig.get("info", "lang")
-                self.progress_cancel_button.set_label(self.get_string('ubiquity/text/progress_cancel_button', lang=kylang))
-        #end kylin
-
         self.start_slideshow()
         Gtk.main()
         self.pending_quits = max(0, self.pending_quits - 1)
         # postinstall will exit here by calling Gtk.main_quit in
         # find_next_step.
+
+        telemetry.get().done(self.db)
 
         self.unlock_environment()
         if self.oem_user_config:
@@ -847,6 +901,7 @@ class Wizard(BaseFrontend):
             self.finished_dialog.set_keep_above(True)
             self.set_busy_cursor(False)
             self.finished_dialog.run()
+
         elif self.get_reboot():
             self.reboot()
         elif self.get_shutdown():
@@ -872,63 +927,12 @@ class Wizard(BaseFrontend):
             return True
         return False
 
-    # use old slideshow, old slideshow show more well
     def start_slideshow(self):
-        self.progress_mode.set_current_page(
-            self.progress_pages['progress_bar'])
-
-        if not self.slideshow:
-            self.page_mode.hide()
-            return
-
-        self.page_section.hide()
-
-        slideshow_locale = self.slideshow_get_available_locale(
-            self.slideshow, self.locale)
-        slideshow_main = os.path.join(self.slideshow, 'slides', 'index.html')
-
-        parameters = []
-        parameters.append('locale=%s' % slideshow_locale)
-        ltr = i18n.get_string(
-            'default-ltr', slideshow_locale, 'ubiquity/imported')
-        if ltr == 'default:RTL':
-            parameters.append('rtl')
-        parameters_encoded = '&'.join(parameters)
-
-        slides = 'file://%s#%s' % (slideshow_main, parameters_encoded)
-
-        from gi.repository import WebKit
-        # We have no significant browsing interface, so there isn't much point
-        # in WebKit creating a memory-hungry cache.
-        WebKit.set_cache_model(WebKit.CacheModel.DOCUMENT_VIEWER)
-        webview = WebKit.WebView()
-        # WebKit puts file URLs in their own domain by default.
-        # This means that anything which checks for the same origin,
-        # such as creating a XMLHttpRequest, will fail unless this
-        # is disabled.
-        # http://www.gitorious.org/webkit/webkit/commit/624b946
-        s = webview.get_settings()
-        s.set_property('enable-file-access-from-file-uris', True)
-        s.set_property('enable-default-context-menu', False)
-        if (os.environ.get('UBIQUITY_A11Y_PROFILE') == 'screen-reader'):
-            s.set_property('enable-caret-browsing', True)
-
-        webview.connect('new-window-policy-decision-requested',
-                        self.on_slideshow_link_clicked)
-
-        self.webkit_scrolled_window.add(webview)
-        webview.open(slides)
-        # TODO do these in a page loaded callback
-        self.page_mode.show()
-        self.page_mode.set_current_page(1)
-        webview.show()
-        webview.grab_focus()
-
-    def start_slideshow_webkit2(self):
         # WebKit2 spawns a process which we don't want to run as root
         misc.drop_privileges_save()
         self.progress_mode.set_current_page(
             self.progress_pages['progress_bar'])
+        telemetry.get().add_stage('user_done')
 
         if not self.slideshow:
             self.page_mode.hide()
@@ -1068,7 +1072,7 @@ class Wizard(BaseFrontend):
                 cfg.read(os.path.join(self.slideshow, 'slideshow.conf'))
                 config_width = int(cfg.get('Slideshow', 'width'))
                 config_height = int(cfg.get('Slideshow', 'height'))
-            except:
+            except Exception:
                 config_width = 752
                 config_height = 442
             self.webkit_scrolled_window.set_size_request(
@@ -1334,12 +1338,18 @@ class Wizard(BaseFrontend):
     def page_name(self, step_index):
         return self.steps.get_nth_page(step_index).get_name()
 
-    def toggle_next_button(self, label='gtk-go-forward'):
+    def toggle_next_button(self, label='gtk-go-forward', suggested=False):
         if label != 'gtk-go-forward':
             self.next.set_label(self.get_string(label))
         else:
             self.next.set_label(label)
             self.translate_widget(self.next)
+
+        style_context = self.next.get_style_context()
+        if suggested:
+            style_context.add_class('suggested-action')
+        else:
+            style_context.remove_class('suggested-action')
 
     def toggle_skip_button(self, label='skip'):
         self.skip.set_label(self.get_string(label))
@@ -1383,11 +1393,15 @@ class Wizard(BaseFrontend):
                         hasattr(page.ui, 'plugin_on_skip_clicked'))
                     cur.show()
                     is_install = page.ui.get('plugin_is_install')
+                    is_restart = \
+                        page.ui.get('plugin_is_restart')
                     break
         if not cur:
             return False
 
-        if is_install and not self.oem_user_config:
+        if is_restart and not self.oem_user_config:
+            self.toggle_next_button('restart_button', suggested=True)
+        elif is_install and not self.oem_user_config:
             self.toggle_next_button('install_button')
         else:
             self.toggle_next_button()
@@ -1403,7 +1417,10 @@ class Wizard(BaseFrontend):
 
         if self.pagesindex == 0:
             self.allow_go_backward(False)
-        elif self.pages[self.pagesindex - 1].module.NAME == 'partman':
+        elif 'partman' in [page.module.NAME for page in
+            # fix by kylin
+            #               self.pages[:self.pagesindex - 1]]:
+                           self.pages[:self.pagesindex]]:
             # We're past partitioning.  Unless the install fails, there is no
             # going back.
             self.allow_go_backward(False)
@@ -1470,45 +1487,23 @@ class Wizard(BaseFrontend):
 
     def do_reboot(self):
         """Callback for main program to actually reboot the machine."""
-        try:
-            session = dbus.Bus.get_session()
-            gnome_session = session.name_has_owner('org.gnome.SessionManager')
-        except dbus.exceptions.DBusException:
-            gnome_session = False
-
-        if gnome_session:
-            manager = session.get_object('org.gnome.SessionManager',
-                                         '/org/gnome/SessionManager')
-            manager.RequestReboot()
-        else:
-            # don't let reboot race with the shutdown of X in ubiquity-dm;
-            # reboot might be too fast and X will stay around forever instead
-            # of moving to plymouth
-            misc.execute_root(
-                "sh", "-c",
-                "if ! service display-manager status; then killall Xorg; "
-                "while pidof X; do sleep 0.5; done; fi; reboot")
+        # don't let reboot race with the shutdown of X in ubiquity-dm;
+        # reboot might be too fast and X will stay around forever instead
+        # of moving to plymouth
+        misc.execute_root(
+            "sh", "-c",
+            "if ! service display-manager status; then killall Xorg; "
+            "while pidof X; do sleep 0.5; done; fi; reboot")
 
     def do_shutdown(self):
         """Callback for main program to actually shutdown the machine."""
-        try:
-            session = dbus.Bus.get_session()
-            gnome_session = session.name_has_owner('org.gnome.SessionManager')
-        except dbus.exceptions.DBusException:
-            gnome_session = False
-
-        if gnome_session:
-            manager = session.get_object('org.gnome.SessionManager',
-                                         '/org/gnome/SessionManager')
-            manager.RequestShutdown()
-        else:
-            # don't let poweroff race with the shutdown of X in ubiquity-dm;
-            # poweroff might be too fast and X will stay around forever instead
-            # of moving to plymouth
-            misc.execute_root(
-                "sh", "-c",
-                "if ! service display-manager status; then killall Xorg; "
-                "while pidof X; do sleep 0.5; done; fi; poweroff")
+        # don't let poweroff race with the shutdown of X in ubiquity-dm;
+        # poweroff might be too fast and X will stay around forever instead
+        # of moving to plymouth
+        misc.execute_root(
+            "sh", "-c",
+            "if ! service display-manager status; then killall Xorg; "
+            "while pidof X; do sleep 0.5; done; fi; poweroff")
 
     def quit_installer(self, *args):
         """Quit installer cleanly."""
@@ -1524,10 +1519,6 @@ class Wizard(BaseFrontend):
         self.warning_dialog.hide()
         if self.dbfilter is not None:
             self.dbfilter.cancel_handler()
-        # kobe
-        filename = '/tmp/kylin-data.ini'
-        if os.path.isfile(filename):
-            os.remove(filename)
         self.quit_main_loop()
 
     # Callbacks
@@ -1618,6 +1609,7 @@ class Wizard(BaseFrontend):
         for i in range(len(self.pages))[index + 1:]:
             self.dot_grid.get_child_at(i, 0).set_fraction(0)
 
+        telemetry.get().add_stage(name)
         syslog.syslog('switched to page %s' % name)
 
     # Callbacks provided to components.
@@ -1708,15 +1700,59 @@ class Wizard(BaseFrontend):
             return False
 
     def switch_to_install_interface(self):
+        if not self.installing:
+            telemetry.get().add_stage(telemetry.START_INSTALL_STAGE_TAG)
         self.installing = True
         self.lockdown_environment()
+
+    def maybe_start_installing(self):
+### change by zz
+#        if not (self.partitioned and self.timezone_set):
+#            syslog.syslog(
+#                'Not installing yet, partitioned: %s, timezone_set %s' %
+#                (self.partitioned, self.timezone_set))
+#            return
+
+        # Setup zfs layout
+        use_zfs = self.db.get('ubiquity/use_zfs')
+        if use_zfs == 'true':
+            misc.execute_root('/usr/share/ubiquity/zsys-setup', 'init')
+
+        syslog.syslog('Starting the installation')
+
+        from ubiquity.debconfcommunicator import DebconfCommunicator
+        if self.parallel_db is not None:
+            self.parallel_db.shutdown()
+        env = os.environ.copy()
+        # debconf-apt-progress, start_debconf()
+        env['DEBCONF_DB_REPLACE'] = 'configdb'
+        env['DEBCONF_DB_OVERRIDE'] = 'Pipe{infd:none outfd:none}'
+        self.parallel_db = DebconfCommunicator('ubiquity',
+                                               cloexec=True,
+                                               env=env)
+        # Start the actual install
+        dbfilter = install.Install(self, db=self.parallel_db)
+        dbfilter.start(auto_process=True)
 
     def find_next_step(self, finished_step):
         # TODO need to handle the case where debconffilters launched from
         # here crash.  Factor code out of dbfilter_handle_status.
         last_page = self.pages[-1].module.__name__
+
+        syslog.syslog("fucking life finished_step : %s " % finished_step )
+        syslog.syslog("fucking life pages[-1] : %s " % self.pages[-1].module.__name__)
+        syslog.syslog("fucking life pages[-2] : %s " % self.pages[-2].module.__name__)
+        syslog.syslog("fucking life lastpage : %s " % last_page)
+        syslog.syslog("fucking life backup : %i " % self.backup)
+        
+        # kylin add, is_oem is last
+        #if os.path.isfile("/tmp/.kylin_reboot_go_oem"):
+        #    last_page = self.pages[-3].module.__name__
+
         if finished_step == last_page and not self.backup:
             self.finished_pages = True
+            syslog.syslog("fucking life enter into last_page")
+
             if self.finished_installing or self.oem_user_config:
                 self.debconf_progress_info('')
                 # thaw container size
@@ -1750,17 +1786,29 @@ class Wizard(BaseFrontend):
             dbfilter = partman_commit.PartmanCommit(self, db=self.parallel_db)
             dbfilter.start(auto_process=True)
 
-        # FIXME OH DEAR LORD.  Use isinstance.
-        elif finished_step == 'ubiquity.components.partman_commit':
-            dbfilter = install.Install(self, db=self.parallel_db)
-            dbfilter.start(auto_process=True)
+        elif finished_step == 'ubi-timezone':
+            self.timezone_set = True
+            # Flush changes to the database so that when the parallel db
+            # starts, it does so with the most recent changes.
+            self.stop_debconf()
+            self.start_debconf()
+            self.maybe_start_installing()
 
+        elif finished_step == 'ubiquity.components.partman_commit':
+            self.partitioned = True
+            self.maybe_start_installing()
+
+        # FIXME OH DEAR LORD.  Use isinstance.
         elif finished_step == 'ubiquity.components.install':
+            syslog.syslog("fucking life now in ubiquity.components.install")
+
             self.finished_installing = True
             if self.finished_pages:
+                syslog.syslog("fucking life now will begin plugininstall")
                 dbfilter = plugininstall.Install(self)
                 dbfilter.start(auto_process=True)
             else:
+                syslog.syslog("fucking life now go the other way ")
                 # temporarily freeze container size
                 allocation = self.progress_section.get_allocation()
                 self.progress_section.set_size_request(
@@ -1770,7 +1818,10 @@ class Wizard(BaseFrontend):
 
         elif finished_step == 'ubiquity.components.plugininstall':
             self.installing = False
+
+            syslog.syslog(syslog.LOG_ERR, "fucking life : success cmd is [%s]" % self.success_cmd)
             self.run_success_cmd()
+
             self.quit_main_loop()
 
     def grub_verify_loop(self, widget, okbutton):
@@ -1843,9 +1894,9 @@ class Wizard(BaseFrontend):
             self.grub_new_device_entry.set_sensitive(True)
 
     def bootloader_dialog(self, current_device):
-        l = self.skip_label.get_label()
-        l = l.replace('${RELEASE}', misc.get_release().name)
-        self.skip_label.set_label(l)
+        ret = self.skip_label.get_label()
+        ret = ret.replace('${RELEASE}', misc.get_release().name)
+        self.skip_label.set_label(ret)
         self.grub_new_device_entry.get_child().set_text(current_device)
         self.grub_new_device_entry.get_child().grab_focus()
         response = self.bootloader_fail_dialog.run()
